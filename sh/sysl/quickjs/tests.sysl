@@ -1,0 +1,314 @@
+// What the binding claims, checked against a running engine.
+//
+// **The layout group is the one that matters most.** Every value in this package crosses to C as a
+// 16-byte aggregate, and if quickjs-ng ever changes that representation nothing else here would fail
+// loudly — the numbers would simply come back wrong. Those four assertions are against the header's
+// own `sizeof` and `offsetof`, so a change fails a build rather than a program.
+
+module sh.sysl.quickjs
+@tests
+
+import sh.sysl.quickjs.c
+import sysl.harness.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// -- the ABI --------------------------------------------------------------------------------------
+
+@test("a JSValue is the two words this package declares")
+layout()
+    assert_eq(c.VALUE_SIZE, 16, "sizeof(JSValue)")
+    assert_eq(c.VALUE_UNION, 0, "the union comes first")
+    assert_eq(c.VALUE_TAG, 8, "the tag follows it")
+    assert_eq(c.VALUE_ALIGN, 8, "and the whole thing is word-aligned")
+
+@test("the tags are the ones the header numbers")
+tags()
+    assert_eq(c.TAG_INT, 0, "JS_TAG_INT")
+    assert_eq(c.TAG_BOOL, 1, "JS_TAG_BOOL")
+    assert_eq(c.TAG_NULL, 2, "JS_TAG_NULL")
+    assert_eq(c.TAG_UNDEFINED, 3, "JS_TAG_UNDEFINED")
+    assert_eq(c.TAG_FLOAT64, 8, "JS_TAG_FLOAT64")
+    check(c.TAG_OBJECT < 0, "every reference-counted tag is negative")
+    check(c.TAG_STRING < 0, "including a string")
+
+// -- evaluating -----------------------------------------------------------------------------------
+
+@test("a script's last expression is what comes back")
+evaluates()
+    val r = realm().unwrap()
+
+    assert_eq(r.eval("1 + 1").unwrap().integer().unwrap(), 2, "arithmetic")
+    assert_eq(r.eval("'a' + 'b'").unwrap().text().unwrap(), "ab", "concatenation")
+    assert_eq(r.eval("[1, 2, 3].map(x => x * 2).join('-')").unwrap().text().unwrap(), "2-4-6", "the standard library is there")
+
+@test("the number type is JavaScript's one number type")
+numbers()
+    val r = realm().unwrap()
+
+    val whole = r.eval("40 + 2").unwrap()
+    check(whole.is_integer(), "an integral result is tagged as an integer")
+    assert_eq(whole.float().unwrap(), 42.0, "and reads as a float too")
+
+    val fraction = r.eval("1 / 4").unwrap()
+    check(!fraction.is_integer(), "a fractional one is not")
+    check(fraction.is_number(), "but it is still a number")
+    assert_eq(fraction.float().unwrap(), 0.25, "carrying its value")
+
+@test("the tag predicates agree with the script")
+predicates()
+    val r = realm().unwrap()
+
+    check(r.eval("undefined").unwrap().is_undefined(), "undefined")
+    check(r.eval("null").unwrap().is_null(), "null")
+    check(r.eval("true").unwrap().is_bool(), "a boolean")
+    check(r.eval("'x'").unwrap().is_string(), "a string")
+    check(r.eval("({})").unwrap().is_object(), "an object")
+    check(r.eval("[]").unwrap().is_array(), "an array")
+    check(r.eval("(() => 1)").unwrap().is_function(), "a function")
+    check(r.eval("new Error('x')").unwrap().is_error(), "an error")
+    check(r.eval("new Date(0)").unwrap().is_date(), "a date")
+
+@test("coercion is JavaScript's, not a type test")
+coercion()
+    val r = realm().unwrap()
+
+    assert_eq(r.eval("'3'").unwrap().integer().unwrap(), 3, "a numeric string reads as a number")
+    assert_eq(r.eval("({ valueOf: () => 7 })").unwrap().integer().unwrap(), 7, "and an object through valueOf")
+    check(r.eval("[]").unwrap().truth().unwrap(), "an empty array is truthy, as JavaScript says")
+    check(!r.eval("0").unwrap().truth().unwrap(), "and zero is not")
+
+// -- exceptions -----------------------------------------------------------------------------------
+
+@test("a throw comes back as an Err carrying what was thrown")
+throwing()
+    val r = realm().unwrap()
+
+    r.eval("throw new Error('nope')") match
+        Ok(_) -> check(false, "a throw must not answer Ok")
+        Err(e) ->
+            assert_eq(e.message, "Error: nope", "the message is the engine's own rendering")
+            check(e.stack != "", "and an Error carries a stack")
+
+@test("a syntax error is reported like any other failure")
+syntax_error()
+    val r = realm().unwrap()
+
+    r.eval("this is not javascript") match
+        Ok(_) -> check(false, "bad source must not answer Ok")
+        Err(e) -> check(e.message.contains("SyntaxError"), s"the message names the fault, and said: ${e.message}")
+
+@test("a thrown value that is not an Error still renders")
+throwing_a_plain_value()
+    val r = realm().unwrap()
+
+    r.eval("throw 'just a string'") match
+        Ok(_) -> check(false, "a throw must not answer Ok")
+        Err(e) ->
+            assert_eq(e.message, "just a string", "the value rendered as itself")
+            assert_eq(e.stack, "", "and a string has no stack")
+
+@test("an exception leaves the realm usable")
+recovering()
+    val r = realm().unwrap()
+
+    check(r.eval("throw new Error('first')").is_err(), "the first evaluation fails")
+    assert_eq(r.eval("2 + 2").unwrap().integer().unwrap(), 4, "and the next one still runs")
+
+// -- objects and arrays ---------------------------------------------------------------------------
+
+@test("properties read and write by name")
+properties()
+    val r = realm().unwrap()
+
+    val o = r.eval("({ a: 1, b: 'two' })").unwrap()
+
+    assert_eq(o.get("a").unwrap().integer().unwrap(), 1, "a number property")
+    assert_eq(o.get("b").unwrap().text().unwrap(), "two", "a string property")
+    check(o.get("missing").unwrap().is_undefined(), "an absent one is undefined, not an error")
+
+    o.set("c", r.integer(3)).unwrap()
+
+    assert_eq(o.get("c").unwrap().integer().unwrap(), 3, "and a property written from sysl reads back")
+
+@test("an object built in sysl is visible to the script")
+building_an_object()
+    val r = realm().unwrap()
+
+    val o = r.object()
+
+    o.set("name", r.text("sysl")).unwrap()
+    o.set("year", r.integer(2026)).unwrap()
+
+    r.global().set("built", o).unwrap()
+
+    assert_eq(r.eval("built.name + ' ' + built.year").unwrap().text().unwrap(), "sysl 2026", "the script reads what sysl wrote")
+
+@test("arrays index and measure")
+arrays()
+    val r = realm().unwrap()
+
+    val a = r.eval("[10, 20, 30]").unwrap()
+
+    assert_eq(a.length().unwrap(), 3, "length")
+    assert_eq(a.at(1).unwrap().integer().unwrap(), 20, "an element by index")
+
+    a.set_at(1, r.integer(99)).unwrap()
+
+    assert_eq(a.at(1).unwrap().integer().unwrap(), 99, "and one written from sysl")
+
+    val built = r.array()
+
+    built.set_at(0, r.text("x")).unwrap()
+    built.set_at(1, r.text("y")).unwrap()
+
+    assert_eq(built.length().unwrap(), 2, "an array built in sysl has a length")
+
+// -- calling into JavaScript ----------------------------------------------------------------------
+
+@test("a JavaScript function is called from sysl")
+calling_js()
+    val r = realm().unwrap()
+
+    val f = r.eval("(a, b) => a * b").unwrap()
+
+    var args: Buf[&Value] = buf()
+
+    args.push(r.integer(6))
+    args.push(r.integer(7))
+
+    assert_eq(f.call(args.view()).unwrap().integer().unwrap(), 42, "with the arguments it was given")
+
+@test("a method is called with its receiver")
+calling_with_this()
+    val r = realm().unwrap()
+
+    val o = r.eval("({ n: 5, times: function (k) { return this.n * k } })").unwrap()
+    val f = o.get("times").unwrap()
+
+    var args: Buf[&Value] = buf()
+
+    args.push(r.integer(4))
+
+    assert_eq(f.call_on(o, args.view()).unwrap().integer().unwrap(), 20, "this is the object it was read from")
+
+@test("an exception thrown by a called function is an Err")
+calling_that_throws()
+    val r = realm().unwrap()
+
+    val f = r.eval("() => { throw new Error('inside') }").unwrap()
+
+    var none: Buf[&Value] = buf()
+
+    f.call(none.view()) match
+        Ok(_) -> check(false, "a throwing function must not answer Ok")
+        Err(e) -> assert_eq(e.message, "Error: inside", "carrying what it threw")
+
+// -- calling out of JavaScript --------------------------------------------------------------------
+
+@test("a sysl closure is a JavaScript function")
+a_native_function()
+    var r = realm().unwrap()
+
+    r.define("twice", 1, (call) -> Ok(call.realm.integer(call.arg(0).integer()? * 2))).unwrap()
+
+    assert_eq(r.eval("twice(21)").unwrap().integer().unwrap(), 42, "the script called into sysl")
+
+@test("the closure sees what it captured")
+a_native_closure()
+    var r = realm().unwrap()
+
+    val factor = 3
+
+    r.define("scale", 1, (call) -> Ok(call.realm.integer(call.arg(0).integer()? * factor))).unwrap()
+
+    assert_eq(r.eval("scale(14)").unwrap().integer().unwrap(), 42, "a captured value reached the call")
+
+@test("a native function takes and answers any value, not only numbers")
+a_native_over_strings()
+    var r = realm().unwrap()
+
+    r.define("shout", 1, (call) -> Ok(call.realm.text(call.arg(0).text()? + "!"))).unwrap()
+
+    assert_eq(r.eval("shout('hi')").unwrap().text().unwrap(), "hi!", "strings cross both ways")
+
+@test("arguments past the end are undefined, as they are in JavaScript")
+a_native_called_short()
+    var r = realm().unwrap()
+
+    r.define("second", 2, (call) -> Ok(call.realm.boolean(call.arg(1).is_undefined()))).unwrap()
+
+    check(r.eval("second('only')").unwrap().truth().unwrap(), "the absent argument is undefined")
+    check(!r.eval("second('a', 'b')").unwrap().truth().unwrap(), "and a supplied one is not")
+
+@test("several native functions coexist, each with its own capture")
+several_natives()
+    var r = realm().unwrap()
+
+    r.define("addOne", 1, (call) -> Ok(call.realm.integer(call.arg(0).integer()? + 1))).unwrap()
+    r.define("addTen", 1, (call) -> Ok(call.realm.integer(call.arg(0).integer()? + 10))).unwrap()
+
+    assert_eq(r.eval("addOne(1) * 100 + addTen(1)").unwrap().integer().unwrap(), 211, "each closure kept its own")
+
+@test("an Err from a native function becomes a JavaScript exception the script can catch")
+a_native_that_fails()
+    var r = realm().unwrap()
+
+    r.define("refuse", 0, (call) -> Err(Error("not today", ""))).unwrap()
+
+    assert_eq(r.eval("try { refuse() } catch (e) { e.message }").unwrap().text().unwrap(), "not today",
+              "the script caught what sysl refused with")
+
+@test("a native function reached as a value rather than as a global")
+a_native_as_a_value()
+    var r = realm().unwrap()
+
+    val f = r.function("hidden", 1, (call) -> Ok(call.realm.integer(call.arg(0).integer()? + 1))).unwrap()
+    val holder = r.object()
+
+    holder.set("bump", f).unwrap()
+    r.global().set("holder", holder).unwrap()
+
+    assert_eq(r.eval("holder.bump(41)").unwrap().integer().unwrap(), 42, "it works wherever it is put")
+
+// -- lifetimes ------------------------------------------------------------------------------------
+
+@test("a value outlives the last name for its realm")
+a_value_keeps_its_realm()
+    val v = make_a_string()
+
+    assert_eq(v.text().unwrap(), "still here", "the realm was kept alive by the value alone")
+
+private make_a_string() -> &Value
+    val r = realm().unwrap()
+
+    r.eval("'still here'").unwrap()
+
+@test("two realms in one runtime are separate worlds")
+two_realms()
+    val rt = runtime().unwrap()
+    var a = realm_in(rt).unwrap()
+    var b = realm_in(rt).unwrap()
+
+    a.eval("var shared = 1").unwrap()
+
+    check(b.eval("typeof shared").unwrap().text().unwrap() == "undefined", "a global in one is not in the other")
+
+@test("a runtime with a memory limit refuses rather than dying")
+a_memory_limit()
+    val rt = runtime().unwrap()
+
+    rt.limit_memory(1 << 20)
+
+    var r = realm_in(rt).unwrap()
+
+    check(r.eval("var a = []; while (true) a.push(new Array(1000))").is_err(), "the allocation failed as an exception")
+
+// -- modules --------------------------------------------------------------------------------------
+
+@test("module source evaluates as a module")
+a_module()
+    val r = realm().unwrap()
+
+    check(r.eval_module("export const n = 1").is_ok(), "an export is legal in module source")
+    check(r.eval("export const n = 1").is_err(), "and illegal in script source")

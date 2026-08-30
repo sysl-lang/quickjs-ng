@@ -1,0 +1,51 @@
+// JavaScript for sysl — quickjs-ng, embedded.
+//
+//     dependencies {
+//       quickjs { git = "github.com/sysl-lang/quickjs-ng", version = "0.1.0" }
+//     }
+//
+// The coordinate is identity rather than a URL, and the version is the tag `v0.1.0` here.
+//
+// **quickjs-ng has to be installed, and so do its headers.**
+//
+//     brew install quickjs-ng
+//
+// It is a fork of Bellard's quickjs rather than a repackaging, and this binding is against the fork:
+// `JS_FreeValue`, `JS_DupValue` and `JS_ToCStringLen2` are real symbols here and `static inline` in
+// the original, which is most of why no C shim is needed.
+//
+// **Nothing is vendored, and that is a claim about where the code can run rather than a shortcut.**
+// The org vendors a library so that it reaches a bare-metal target; a JavaScript engine carrying a
+// bytecode interpreter, a garbage collector and the whole ECMAScript library is not what goes on a
+// microcontroller, so vendoring would buy nothing and cost a CVE watch on a fast-moving upstream.
+
+package {
+  name    = "quickjs"
+  version = "0.1.0"
+
+  // The compiler this was written against and the only one it is known to build with.
+  sysl = "0.0.93"
+}
+
+// **`headers` rather than `pkg_config`, and that is quickjs-ng's doing.** It installs a CMake
+// package configuration and no `.pc` file, so there is nothing for `pkg-config` to answer — the
+// path is passed instead:
+//
+//     sysl test . --include-path quickjs=/opt/homebrew/include --link-path /opt/homebrew/lib
+//
+// **`os`, because the engine reaches libc for its heap, its clock and `Date`.** A freestanding
+// target has none of that, and saying so here turns "this will not work" into one refusal before
+// anything is compiled.
+//
+// **A 64-bit target, which nothing in this clause can say.** `quickjs.h` picks a NaN-boxed `JSValue`
+// — a bare `uint64_t` — whenever `INTPTR_MAX < INT64_MAX`, and the two-word struct this package
+// declares would then describe the wrong thing. The layout tests beside the binding are what
+// notice; there is no capability for a pointer width.
+requires {
+  os   = true
+  heap = true
+
+  headers {
+    quickjs = "quickjs-ng's headers — `brew install quickjs-ng`; there is no .pc file, so the include path is passed rather than probed"
+  }
+}

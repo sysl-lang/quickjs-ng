@@ -1,0 +1,490 @@
+// JavaScript for sysl — a quickjs-ng embedding.
+//
+// A program makes a `Runtime`, opens a `Realm` in it, and evaluates source. What comes back is a
+// `&Value`, and what a `&Value` costs is the whole design decision in this package: every JavaScript
+// value quickjs hands over carries a reference count that somebody has to give back, and here that
+// somebody is the destructor. Nothing in a program calls `free`.
+//
+//     val r = realm()?
+//     val v = r.eval("[1, 2, 3].map(x => x * 2).join('-')")?
+//
+//     print(v.text()?)                          // 2-4-6
+//
+// **A sysl closure can be a JavaScript function.** `define` registers one, and the script calls it by
+// name like any other:
+//
+//     val scale = 3
+//
+//     r.define("scale", 1, (call) -> Ok(call.realm.number(call.arg(0).float()? * scale)))
+//
+//     print(r.eval("scale(14)")?.float()?)      // 42
+//
+// **What is not here yet**: promises and the job queue, ES modules with a resolver, classes with
+// sysl-owned instance data, and typed arrays. Each is a coherent piece of work of its own; the
+// surface below is the one an embedding needs before any of them are interesting.
+
+module sh.sysl.quickjs
+
+import sh.sysl.quickjs.c
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, from_cstring}
+import sysl.slices.{as_ptr, as_mut_ptr}
+
+// ## What goes wrong
+//
+// **A JavaScript exception is a value, not a string**, so the message here is what the engine's own
+// `toString` made of it and the stack is `error.stack` where the thrown value had one. Both are
+// copied out before the exception value is released, which is why this struct carries no reference:
+// an `Error` outlives the realm it came from, and a caller printing one after teardown is an ordinary
+// thing to do.
+struct Error
+    message: string
+    stack: string
+
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) =
+        if self.stack == "" then self.message.display(out, fmt) else s"${self.message}\n${self.stack}".display(out, fmt)
+
+private fault(message: string) -> Error = Error(message, "")
+
+// ## The runtime
+//
+// One heap, one atom table, one garbage collector. Several realms may share a runtime and values may
+// move between them; a value may never cross to a different runtime.
+//
+// **The constructor answers a `&Runtime` rather than a `Runtime`, and it has to**: a destructor runs
+// when a box's count reaches zero and never for a plain value, so a by-value constructor here would
+// declare `JS_FreeRuntime` and never call it.
+struct Runtime
+    private rt: *c.Runtime
+
+    // Runs a full garbage collection. quickjs collects cycles on its own schedule; this is for a
+    // program that would rather choose the moment.
+    collect(self) = c.run_gc(self.rt)
+
+    // A ceiling on the bytes this runtime will allocate. Past it, allocation fails and the script
+    // sees an `OutOfMemory` exception rather than the process dying — which is the point of running
+    // untrusted script in a runtime of its own.
+    limit_memory(self, bytes: usize) = c.set_memory_limit(self.rt, bytes)
+
+    // A ceiling on interpreter stack depth, in bytes. Deep recursion in the script then throws
+    // rather than reaching the real stack guard.
+    limit_stack(self, bytes: usize) = c.set_max_stack_size(self.rt, bytes)
+end Runtime
+
+impl Drop for Runtime
+    drop(self) = c.free_runtime(self.rt)
+
+runtime() -> Result[&Runtime, Error]
+    val rt = c.new_runtime()
+
+    if usize(rt) == 0 then return Err(fault("quickjs could not make a runtime"))
+
+    Ok(Runtime(rt))
+
+// ## A realm
+//
+// One set of globals and one set of intrinsics. **It keeps its runtime alive**, so a program that
+// wants only one realm need never name the runtime at all — `realm()` below makes both.
+//
+// `natives` is what keeps a registered sysl closure alive for as long as the realm can call it. The
+// edge back the other way, from a registered function to the realm, is **weak** — a strong one would
+// be a cycle, and a cycle is the one thing reference counting cannot collect.
+struct Realm
+    private ctx: *c.Context
+    private rt: &Runtime
+    private natives: Buf[&Native]
+
+    // The `globalThis` of this realm.
+    global(self) -> &Value = self.value(c.get_global_object(self.ctx))
+
+    // ### Evaluating
+    //
+    // **`flags` is `EVAL_TYPE_GLOBAL`**, so `var` declarations land on the global object and a later
+    // `eval` sees them. Evaluate as a module instead when the source uses `import` or `export`.
+    eval(self, source: string, name: string = "<eval>") -> Result[&Value, Error] =
+        self.evaluate(source, name, c.EVAL_TYPE_GLOBAL)
+
+    // Module source. The answer is the module's namespace rather than a last expression, and a
+    // top-level `await` in it makes a promise nothing here yet drives.
+    eval_module(self, source: string, name: string = "<module>") -> Result[&Value, Error] =
+        self.evaluate(source, name, c.EVAL_TYPE_MODULE)
+
+    private evaluate(self, source: string, name: string, flags: i32) -> Result[&Value, Error]
+        // **quickjs requires the source to be NUL-terminated even though it is given a length**, so
+        // a string's own bytes will not do and both arguments go through `cstring`.
+        val src = cstring(source)
+        val file = cstring(name)
+        val raw = c.eval(self.ctx, src.ptr, src.len, file.ptr, flags)
+
+        if raw.tag == c.TAG_EXCEPTION then return Err(self.take_exception())
+
+        Ok(self.value(raw))
+
+    // ### Making values
+    //
+    // The scalar constructors assemble the 16 bytes directly, which is what `JS_NewInt32` and its
+    // neighbours do — they are `static inline` in the header, so there is no symbol to call and the
+    // arithmetic is the whole of the function.
+
+    undefined(self) -> &Value = self.value(mkval(c.TAG_UNDEFINED, 0))
+    `null`(self) -> &Value = self.value(mkval(c.TAG_NULL, 0))
+    boolean(self, b: bool) -> &Value = self.value(mkval(c.TAG_BOOL, if b then 1 else 0))
+    integer(self, n: i32) -> &Value = self.value(mkval(c.TAG_INT, n))
+
+    // **An integer-valued double comes back tagged as an integer**, which is JavaScript's own model
+    // rather than a shortcut here: there is one number type and quickjs stores it in whichever half
+    // of the union fits.
+    number(self, d: f64) -> &Value = self.value(c.new_number(self.ctx, d))
+
+    big(self, n: i64) -> &Value = self.value(c.new_big_int64(self.ctx, n))
+
+    // Copies the bytes; the caller's string is its own afterwards.
+    text(self, s: string) -> &Value = self.value(c.new_string_len(self.ctx, as_ptr(s.bytes), s.bytes.len))
+
+    object(self) -> &Value = self.value(c.new_object(self.ctx))
+    array(self) -> &Value = self.value(c.new_array(self.ctx))
+
+    // ### Registering a sysl function
+    //
+    // `arity` is what the function reports as its `length` in JavaScript. It is not enforced — a
+    // script may call with fewer arguments or more, and `Call.arg` answers `undefined` past the end.
+    define(*self, name: string, arity: i32, f: &Fn(Call) -> Result[&Value, Error]) -> Result[unit, Error]
+        val fn = self.native(name, arity, f)?
+        val global = c.get_global_object(self.ctx)
+        val prop = cstring(name)
+
+        // **`JS_SetPropertyStr` takes ownership of the value**, which is why `fn` is handed over raw
+        // and not duplicated: it came back from `JS_NewCClosure` with the one reference this call
+        // consumes.
+        val ok = c.set_property_str(self.ctx, global, prop.ptr, fn)
+
+        c.free_value(self.ctx, global)
+
+        if ok < 0 then return Err(self.take_exception())
+
+        Ok(())
+
+    // The same function as a value, for a program putting it somewhere other than the global object.
+    function(*self, name: string, arity: i32, f: &Fn(Call) -> Result[&Value, Error]) -> Result[&Value, Error]
+        val raw = self.native(name, arity, f)?
+
+        Ok(self.value(raw))
+
+    private native(*self, name: string, arity: i32, f: &Fn(Call) -> Result[&Value, Error]) -> Result[c.Value, Error]
+        val slot: &Native = Native(f, self.me())
+        val label = cstring(name)
+
+        // **The opaque is the box's address and the `natives` buffer is what keeps that box alive.**
+        // quickjs will hand this pointer back to the trampoline on every call; nothing about a raw
+        // pointer keeps its object, so the strong reference has to live somewhere and the realm is
+        // where it belongs.
+        self.natives.push(slot)
+
+        val raw = c.new_cclosure(self.ctx, &trampoline, label.ptr, ptr_cast(0usize), arity, 0, ptr_cast(&*slot))
+
+        if raw.tag == c.TAG_EXCEPTION then return Err(self.take_exception())
+
+        Ok(raw)
+
+    // A weak reference to this realm, for the back-edge a registered function needs.
+    private me(self) -> weak Realm = self.self_ref
+
+    private self_ref: weak Realm
+
+    // ### The two places a raw value becomes an owned one
+    //
+    // **`value` adopts a reference and `borrow` takes one of its own.** Which to use follows what
+    // the C function did: anything that *returned* a value handed over a count, and anything reached
+    // through a `JSValueConst` — an argument vector, a value being read past — did not.
+    private[quickjs] value(self, raw: c.Value) -> &Value = Value(raw, self.strong())
+
+    private[quickjs] borrow(self, raw: c.Value) -> &Value = self.value(c.dup_value(self.ctx, raw))
+
+    private strong(self) -> &Realm
+        self.self_ref.get() match
+            Some(r) -> r
+            None -> panic("a realm reached from its own method cannot be gone")
+
+    // Reads the pending exception out and turns it into an `Error`. **Both strings are copied**, so
+    // the exception value itself is released here and the `Error` refers to nothing.
+    private[quickjs] take_exception(self) -> Error
+        val exc = c.get_exception(self.ctx)
+        val message = self.render(exc)
+        val stack = if c.is_error(exc) then self.render_property(exc, "stack") else ""
+
+        c.free_value(self.ctx, exc)
+
+        Error(message, stack)
+
+    private render(self, v: c.Value) -> string
+        val s = c.to_string(self.ctx, v)
+
+        if s.tag == c.TAG_EXCEPTION
+            c.free_value(self.ctx, s)
+
+            return "an exception whose own toString threw"
+        end if
+
+        val out = self.read_cstring(s)
+
+        c.free_value(self.ctx, s)
+
+        out
+
+    private render_property(self, v: c.Value, name: string) -> string
+        val prop = cstring(name)
+        val got = c.get_property_str(self.ctx, v, prop.ptr)
+        val out = if got.tag == c.TAG_UNDEFINED then "" else self.render(got)
+
+        c.free_value(self.ctx, got)
+
+        out
+
+    private read_cstring(self, v: c.Value) -> string
+        var len: usize = 0
+        val p = c.to_cstring_len2(self.ctx, &len, v, false)
+
+        if usize(p) == 0 then return ""
+
+        val out = from_cstring(p) match
+            Ok(s) -> s
+            Err(_) -> ""
+
+        c.free_cstring(self.ctx, p)
+
+        out
+end Realm
+
+impl Drop for Realm
+    // **The context goes and the runtime stays**, because `rt` is a strong reference this struct
+    // holds — so a realm can never outlive the runtime it was opened in, and the two frees are
+    // ordered by construction rather than by a comment asking for it.
+    drop(self) = c.free_context(self.ctx)
+
+// Opens a realm in an existing runtime.
+realm_in(rt: &Runtime) -> Result[&Realm, Error]
+    val ctx = c.new_context(rt.rt)
+
+    if usize(ctx) == 0 then return Err(fault("quickjs could not make a context"))
+
+    var r: &Realm = Realm(ctx, rt, buf(), None)
+
+    r.self_ref = r
+
+    Ok(r)
+
+// A runtime and a realm in it, for the ordinary case of wanting one of each.
+realm() -> Result[&Realm, Error] = realm_in(runtime()?)
+
+// ## A value
+//
+// **Every `&Value` owns exactly one reference to the JavaScript value it names**, and the destructor
+// gives it back. That invariant is what the rest of this file is arranged around: a C function that
+// returns a value hands over a count and the box adopts it; a C function that takes ownership is
+// given a duplicate; and a value merely being looked at is duplicated before it is boxed.
+//
+// It keeps its realm alive, so a value may be read long after the last name for its realm has gone.
+struct Value
+    private raw: c.Value
+    private realm: &Realm
+
+    // ### What it is
+    //
+    // These are tag comparisons, which is exactly what the header's inline predicates are.
+
+    is_undefined(self) -> bool = self.raw.tag == c.TAG_UNDEFINED
+    is_null(self) -> bool = self.raw.tag == c.TAG_NULL
+    is_bool(self) -> bool = self.raw.tag == c.TAG_BOOL
+    is_number(self) -> bool = self.raw.tag == c.TAG_INT || self.raw.tag == c.TAG_FLOAT64
+    is_integer(self) -> bool = self.raw.tag == c.TAG_INT
+    is_big(self) -> bool = self.raw.tag == c.TAG_BIG_INT || self.raw.tag == c.TAG_SHORT_BIG_INT
+    is_string(self) -> bool = self.raw.tag == c.TAG_STRING || self.raw.tag == c.TAG_STRING_ROPE
+    is_symbol(self) -> bool = self.raw.tag == c.TAG_SYMBOL
+    is_object(self) -> bool = self.raw.tag == c.TAG_OBJECT
+
+    is_array(self) -> bool = c.is_array(self.raw)
+    is_error(self) -> bool = c.is_error(self.raw)
+    is_date(self) -> bool = c.is_date(self.raw)
+    is_function(self) -> bool = c.is_function(self.realm.ctx, self.raw)
+
+    // ### Reading it out
+    //
+    // Each of these is JavaScript's own coercion rather than a type test, so `"3"` answers 3 and an
+    // object answers whatever its `valueOf` says. A coercion that throws — a `Symbol`, an object
+    // whose `toString` throws — comes back as an `Err`.
+
+    truth(self) -> Result[bool, Error]
+        val n = c.to_bool(self.realm.ctx, self.raw)
+
+        if n < 0 then return Err(self.realm.take_exception())
+
+        Ok(n != 0)
+
+    integer(self) -> Result[i32, Error]
+        var out: i32 = 0
+
+        if c.to_int32(self.realm.ctx, &out, self.raw) < 0 then return Err(self.realm.take_exception())
+
+        Ok(out)
+
+    long(self) -> Result[i64, Error]
+        var out: i64 = 0
+
+        if c.to_int64(self.realm.ctx, &out, self.raw) < 0 then return Err(self.realm.take_exception())
+
+        Ok(out)
+
+    float(self) -> Result[f64, Error]
+        var out: f64 = 0.0
+
+        if c.to_float64(self.realm.ctx, &out, self.raw) < 0 then return Err(self.realm.take_exception())
+
+        Ok(out)
+
+    // The value as JavaScript's `String(v)` would render it.
+    text(self) -> Result[string, Error]
+        val s = c.to_string(self.realm.ctx, self.raw)
+
+        if s.tag == c.TAG_EXCEPTION
+            c.free_value(self.realm.ctx, s)
+
+            return Err(self.realm.take_exception())
+        end if
+
+        val out = self.realm.read_cstring(s)
+
+        c.free_value(self.realm.ctx, s)
+
+        Ok(out)
+
+    // ### Properties
+
+    get(self, name: string) -> Result[&Value, Error]
+        val prop = cstring(name)
+        val raw = c.get_property_str(self.realm.ctx, self.raw, prop.ptr)
+
+        if raw.tag == c.TAG_EXCEPTION then return Err(self.realm.take_exception())
+
+        Ok(self.realm.value(raw))
+
+    at(self, index: u32) -> Result[&Value, Error]
+        val raw = c.get_property_uint32(self.realm.ctx, self.raw, index)
+
+        if raw.tag == c.TAG_EXCEPTION then return Err(self.realm.take_exception())
+
+        Ok(self.realm.value(raw))
+
+    // **The value is duplicated before it is handed over**, because `JS_SetPropertyStr` takes
+    // ownership and the caller's box still holds its own reference.
+    set(self, name: string, v: &Value) -> Result[unit, Error]
+        val prop = cstring(name)
+        val ok = c.set_property_str(self.realm.ctx, self.raw, prop.ptr, c.dup_value(self.realm.ctx, v.raw))
+
+        if ok < 0 then return Err(self.realm.take_exception())
+
+        Ok(())
+
+    set_at(self, index: u32, v: &Value) -> Result[unit, Error]
+        val ok = c.set_property_uint32(self.realm.ctx, self.raw, index, c.dup_value(self.realm.ctx, v.raw))
+
+        if ok < 0 then return Err(self.realm.take_exception())
+
+        Ok(())
+
+    // The `length` of an array or of anything array-like.
+    length(self) -> Result[i64, Error]
+        var out: i64 = 0
+
+        if c.get_length(self.realm.ctx, self.raw, &out) < 0 then return Err(self.realm.take_exception())
+
+        Ok(out)
+
+    // ### Calling it
+    //
+    // `this` is `undefined` unless one is given, which is what a bare call in a module does.
+    call(self, args: []const &Value) -> Result[&Value, Error] =
+        self.call_on(self.realm.undefined(), args)
+
+    call_on(self, this_value: &Value, args: []const &Value) -> Result[&Value, Error]
+        // **The argument vector is `JSValueConst`**, so quickjs takes no ownership of what is in it
+        // and the raws are copied in without duplicating.
+        var raws: Buf[c.Value] = buf()
+
+        for a in args
+            raws.push(a.raw)
+
+        val raw = c.call(self.realm.ctx, self.raw, this_value.raw, i32(args.len), as_mut_ptr(raws.view()))
+
+        if raw.tag == c.TAG_EXCEPTION then return Err(self.realm.take_exception())
+
+        Ok(self.realm.value(raw))
+end Value
+
+impl Drop for Value
+    drop(self) = c.free_value(self.realm.ctx, self.raw)
+
+impl Display for Value
+    display(self, out: *Writer, fmt: FormatSpec) =
+        val rendered = self.text() match
+            Ok(s) -> s
+            Err(e) -> s"<${e.message}>"
+
+        rendered.display(out, fmt)
+
+// ## Calling out of JavaScript, into sysl
+
+// What a registered function is handed.
+struct Call
+    // The realm the script is running in, for making the value to answer with.
+    realm: &Realm
+
+    // The arguments as the script passed them. **Past the end is not an error** — `arg` answers
+    // `undefined`, which is what JavaScript itself does.
+    args: []const &Value
+
+    arg(self, i: usize) -> &Value = if i < self.args.len then self.args[i] else self.realm.undefined()
+end Call
+
+// One registered function: the sysl closure, and a weak edge back to the realm that can call it.
+private struct Native
+    f: &Fn(Call) -> Result[&Value, Error]
+    realm: weak Realm
+
+// **The trampoline is `@export`ed and it has to be.** A sysl function taking a `Value` by value
+// cannot have its address taken otherwise: an aggregate crosses to C in the registers that machine's
+// convention names rather than the ones a sysl call uses, and the compiler refuses `&f` saying so.
+// One exported function serves every registered closure, because `JS_NewCClosure` gives each
+// function object its own opaque and hands it back here.
+@export("sysl_quickjs_trampoline")
+trampoline(ctx: *c.Context, this_value: c.Value, argc: i32, argv: *c.Value, magic: i32, opaque: *u8) -> c.Value
+    val native: *Native = ptr_cast(opaque)
+
+    (*native).realm.get() match
+        Some(realm) ->
+            var args: Buf[&Value] = buf()
+
+            for i in 0..<usize(argc)
+                // **Every argument is duplicated as it is boxed.** They arrive as `JSValueConst`,
+                // which is quickjs's way of saying the callee owns none of them — so a box adopting
+                // one directly would free a reference it never took, and the script would lose a
+                // value it is still using.
+                args.push(realm.borrow(argv[i]))
+
+            (*native).f(Call(realm, args.view())) match
+                Ok(v) ->
+                    // The return takes ownership, and the box still holds its own.
+                    c.dup_value(ctx, v.raw)
+
+                Err(e) ->
+                    val message = cstring(e.message)
+
+                    c.throw_type_error(ctx, message.ptr)
+
+                    mkval(c.TAG_EXCEPTION, 0)
+
+        None -> mkval(c.TAG_UNDEFINED, 0)
+
+// Assembles the 16 bytes of a non-reference-counted value, which is what `JS_MKVAL` is. The union's
+// low word is the payload and the rest of it is not read for any of these tags.
+private mkval(tag: i64, v: i32) -> c.Value = c.Value(u64(u32(v)), tag)

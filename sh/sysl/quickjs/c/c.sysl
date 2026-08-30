@@ -1,0 +1,180 @@
+// quickjs-ng as its header declares it, and nothing else.
+//
+// **There is no C in this repository and no shim, which is unusual for a binding this size.**
+// quickjs-ng promoted to real symbols the three functions that would otherwise have forced one:
+// `JS_FreeValue`, `JS_DupValue` and `JS_ToCStringLen2` are `static inline` in Bellard's quickjs and
+// are exported here. What is left inline is tag arithmetic — `JS_MKVAL` and the `JS_Is*` predicates —
+// and tag arithmetic is a struct field comparison that sysl can do for itself once it knows the
+// layout, which `Value` below records and the tests beside this file pin.
+//
+// **Nothing is vendored.** quickjs-ng is a system library, and the reason the org's other bindings
+// vendor their C does not apply: an embedded target is the only thing vendoring buys, and a
+// JavaScript engine with a bytecode interpreter, a garbage collector and the whole ECMAScript
+// library is not what goes on a microcontroller. It has an active CVE history, which is what a stale
+// copy costs.
+//
+// Nothing here is meant to be called by a program. Every function takes or answers a raw `Value`
+// whose reference count is the caller's to manage; the module above turns those into `&Value` boxes
+// whose destructor does it.
+
+module sh.sysl.quickjs.c
+
+// `libqjs`, not `libquickjs` — the shared library takes the short name.
+@link("qjs")
+
+// `offsetof` is stddef's; `quickjs.h` pulls in stdio, stdint, string and math but not that.
+@include("stddef.h")
+@include("quickjs.h")
+
+// ## The two handles
+//
+// A runtime owns the heap, the atom table and the garbage collector. A context owns one set of
+// global objects and the intrinsics; several may share a runtime, and values may not cross between
+// runtimes.
+opaque struct Runtime
+opaque struct Context
+
+// ## A JavaScript value
+//
+// **The 16 bytes C lays out on a 64-bit target: an eight-byte union and an eight-byte tag.** The
+// header picks this representation whenever `INTPTR_MAX == INT64_MAX`; the NaN-boxed alternative is
+// for 32-bit builds and a `JSValue` is then a bare `uint64_t`, which this struct would not describe.
+// That is why the package requires a 64-bit target rather than merely happening to want one.
+//
+// `bits` is the union read as an integer, and what it holds follows the tag: a sign-extended `i32`
+// for `TAG_INT` and `TAG_BOOL`, a pointer for every negative (reference-counted) tag, and the
+// IEEE-754 bit pattern for `TAG_FLOAT64`. The module above reads the float half through a
+// `ptr_cast`, which is a reinterpretation rather than a conversion.
+//
+// **The whole binding rests on this crossing to C correctly**, so `tests.sysl` asserts the size, the
+// two offsets and the alignment against the header's own `sizeof` and `offsetof` — a quickjs-ng
+// release that changed the representation then fails a test instead of corrupting every value.
+struct Value
+    bits: u64
+    tag: i64
+
+c const
+    VALUE_SIZE:  usize = "sizeof(JSValue)"
+    VALUE_UNION: usize = "offsetof(JSValue, u)"
+    VALUE_TAG:   usize = "offsetof(JSValue, tag)"
+    VALUE_ALIGN: usize = "_Alignof(JSValue)"
+
+// **The tags, read rather than transcribed.** Every one with a reference count is negative, which is
+// the single test a `Drop` needs — but `JS_FreeValue` makes it itself, so the module above frees
+// uniformly and lets quickjs decide.
+c const
+    TAG_BIG_INT:       i64 = "JS_TAG_BIG_INT"
+    TAG_SYMBOL:        i64 = "JS_TAG_SYMBOL"
+    TAG_STRING:        i64 = "JS_TAG_STRING"
+    TAG_STRING_ROPE:   i64 = "JS_TAG_STRING_ROPE"
+    TAG_MODULE:        i64 = "JS_TAG_MODULE"
+    TAG_OBJECT:        i64 = "JS_TAG_OBJECT"
+    TAG_INT:           i64 = "JS_TAG_INT"
+    TAG_BOOL:          i64 = "JS_TAG_BOOL"
+    TAG_NULL:          i64 = "JS_TAG_NULL"
+    TAG_UNDEFINED:     i64 = "JS_TAG_UNDEFINED"
+    TAG_UNINITIALIZED: i64 = "JS_TAG_UNINITIALIZED"
+    TAG_EXCEPTION:     i64 = "JS_TAG_EXCEPTION"
+    TAG_SHORT_BIG_INT: i64 = "JS_TAG_SHORT_BIG_INT"
+    TAG_FLOAT64:       i64 = "JS_TAG_FLOAT64"
+
+// ## Runtimes and contexts
+
+extern "JS_NewRuntime" new_runtime() -> *Runtime
+extern "JS_FreeRuntime" free_runtime(rt: *Runtime)
+extern "JS_RunGC" run_gc(rt: *Runtime)
+extern "JS_SetMemoryLimit" set_memory_limit(rt: *Runtime, limit: usize)
+extern "JS_SetMaxStackSize" set_max_stack_size(rt: *Runtime, size: usize)
+extern "JS_SetGCThreshold" set_gc_threshold(rt: *Runtime, gc_threshold: usize)
+
+extern "JS_NewContext" new_context(rt: *Runtime) -> *Context
+extern "JS_FreeContext" free_context(ctx: *Context)
+extern "JS_GetRuntime" get_runtime(ctx: *Context) -> *Runtime
+
+// ## Evaluation
+//
+// **`input` must be NUL-terminated even though a length is passed**, which is quickjs's rule rather
+// than an oversight, so the module above goes through `sysl.text.cstring` rather than handing over a
+// slice's bytes.
+c const
+    EVAL_TYPE_GLOBAL:       i32 = "JS_EVAL_TYPE_GLOBAL"
+    EVAL_TYPE_MODULE:       i32 = "JS_EVAL_TYPE_MODULE"
+    EVAL_FLAG_STRICT:       i32 = "JS_EVAL_FLAG_STRICT"
+    EVAL_FLAG_COMPILE_ONLY: i32 = "JS_EVAL_FLAG_COMPILE_ONLY"
+
+extern "JS_Eval" eval(ctx: *Context, input: *u8, len: usize, filename: *u8, flags: i32) -> Value
+
+// ## Reference counts
+//
+// A `JSValue` parameter takes ownership and a `JSValueConst` one does not; the two are the same type
+// outside quickjs's own checking build, so the distinction is documented on each declaration here
+// rather than expressed.
+extern "JS_FreeValue" free_value(ctx: *Context, v: Value)
+extern "JS_DupValue" dup_value(ctx: *Context, v: Value) -> Value
+
+// ## Making values
+//
+// The scalar constructors are all `static inline` wrappers over `JS_MKVAL`, so the module above
+// builds those structs itself. What needs a call is anything that allocates.
+extern "JS_NewNumber" new_number(ctx: *Context, d: f64) -> Value
+extern "JS_NewBigInt64" new_big_int64(ctx: *Context, v: i64) -> Value
+extern "JS_NewStringLen" new_string_len(ctx: *Context, s: *u8, len: usize) -> Value
+extern "JS_NewObject" new_object(ctx: *Context) -> Value
+extern "JS_NewArray" new_array(ctx: *Context) -> Value
+
+// ## Reading values out
+
+extern "JS_ToBool" to_bool(ctx: *Context, v: Value) -> i32
+extern "JS_ToInt32" to_int32(ctx: *Context, out: *i32, v: Value) -> i32
+extern "JS_ToInt64" to_int64(ctx: *Context, out: *i64, v: Value) -> i32
+extern "JS_ToFloat64" to_float64(ctx: *Context, out: *f64, v: Value) -> i32
+extern "JS_ToString" to_string(ctx: *Context, v: Value) -> Value
+
+// **The string that comes back is quickjs's and must go back to `JS_FreeCString`.** It is
+// NUL-terminated and UTF-8, and `plen` answers the length without the terminator.
+extern "JS_ToCStringLen2" to_cstring_len2(ctx: *Context, plen: *usize, v: Value, cesu8: bool) -> *u8
+extern "JS_FreeCString" free_cstring(ctx: *Context, p: *u8)
+
+// ## Type tests that are real calls
+//
+// The tag predicates are inline and the module above does them itself; these four are not, because
+// what they ask is about the object rather than about the tag.
+extern "JS_IsFunction" is_function(ctx: *Context, v: Value) -> bool
+extern "JS_IsArray" is_array(v: Value) -> bool
+extern "JS_IsError" is_error(v: Value) -> bool
+extern "JS_IsDate" is_date(v: Value) -> bool
+
+// ## Properties
+
+extern "JS_GetGlobalObject" get_global_object(ctx: *Context) -> Value
+extern "JS_GetPropertyStr" get_property_str(ctx: *Context, obj: Value, prop: *u8) -> Value
+extern "JS_GetPropertyUint32" get_property_uint32(ctx: *Context, obj: Value, idx: u32) -> Value
+extern "JS_SetPropertyStr" set_property_str(ctx: *Context, obj: Value, prop: *u8, v: Value) -> i32
+extern "JS_SetPropertyUint32" set_property_uint32(ctx: *Context, obj: Value, idx: u32, v: Value) -> i32
+extern "JS_GetLength" get_length(ctx: *Context, obj: Value, out: *i64) -> i32
+extern "JS_SetLength" set_length(ctx: *Context, obj: Value, len: i64) -> i32
+
+// ## Calling into JavaScript
+
+extern "JS_Call" call(ctx: *Context, fn: Value, this_obj: Value, argc: i32, argv: *Value) -> Value
+
+// ## Exceptions
+
+extern "JS_HasException" has_exception(ctx: *Context) -> bool
+extern "JS_GetException" get_exception(ctx: *Context) -> Value
+extern "JS_Throw" throw(ctx: *Context, obj: Value) -> Value
+extern "JS_ThrowTypeError" throw_type_error(ctx: *Context, fmt: *u8) -> Value
+extern "JS_NewError" new_error(ctx: *Context) -> Value
+
+// ## Calling out of JavaScript, into sysl
+//
+// **`JS_NewCClosure` is what makes a sysl *closure* reachable from a script**, and it is the reason
+// this binding needs no magic index and does not claim the context's single opaque slot: every
+// function object carries its own `void *`, and a finalizer is called when that object is collected.
+//
+// The trampoline the module above registers is `@export`ed, and it has to be: a sysl function taking
+// a `Value` by value cannot have its address taken otherwise, because an aggregate crosses to C in
+// the registers that machine's convention names rather than the ones a sysl call uses. The compiler
+// refuses the address with that in as many words, which is a good diagnostic to have met before
+// meeting it in a link error.
+extern "JS_NewCClosure" new_cclosure(ctx: *Context, f: *extern(*Context, Value, i32, *Value, i32, *u8) -> Value, name: *u8, finalize: *u8, length: i32, magic: i32, opaque: *u8) -> Value

@@ -4,7 +4,7 @@
 
 ```
 dependencies {
-  quickjs { git = "github.com/sysl-lang/quickjs-ng", version = "0.1.0" }
+  quickjs { git = "github.com/sysl-lang/quickjs-ng", version = "0.2.0" }
 }
 ```
 
@@ -109,9 +109,37 @@ changed the representation then fails a build rather than returning wrong number
 NaN-boxed `JSValue` — a bare `uint64_t` — whenever `INTPTR_MAX < INT64_MAX`, and the two-word struct
 would then describe the wrong thing. The layout tests are what notice.
 
+## Promises and the job queue
+
+**A promise's continuation is a job, and nothing runs a job but a drain.** quickjs enqueues one every
+time a promise settles or an `async` function suspends, and `eval` answers the moment the
+*synchronous* part of the script is done — so an embedding that never drains has promises that
+resolve and continuations that never happen, which reads as a program that hung rather than as a
+missing call.
+
+```sysl
+val r = realm()?
+
+print(r.eval("(async () => { const n = await Promise.resolve(6); return n * 7 })()")?
+       .settled()?.integer()?)                 // 42
+```
+
+`settled` is the whole of what an embedding usually wants: it drains and then reads. Underneath it,
+`realm.jobs()` runs the queue to empty and `realm.job()` runs one; `value.state()` answers
+`Pending`, `Fulfilled`, `Rejected` or `NotAPromise`, and `value.result()` is what a settled one
+settled to.
+
+**The drain is a REALM's and not a runtime's**, because a job that throws leaves its exception on a
+*context* and a runtime has none to read it from. One runtime may hold several realms, so a job
+belonging to another one is named as that rather than reported by reading this realm's exception slot
+and saying whatever happened to be there.
+
+**A drain is bounded**, because a job may enqueue another one — a promise chain that resolves in a
+loop does it by accident — and an unbounded drain is then a hang with nothing on screen.
+
 ## What is not here yet
 
-Promises and the job queue, ES modules with a resolver, classes with sysl-owned instance data, and
+ES modules with a resolver, classes with sysl-owned instance data, and
 typed arrays. Each is a coherent piece of work of its own; the surface here is the one an embedding
 needs before any of them are interesting.
 

@@ -87,6 +87,34 @@ extern "JS_SetMemoryLimit" set_memory_limit(rt: *Runtime, limit: usize)
 extern "JS_SetMaxStackSize" set_max_stack_size(rt: *Runtime, size: usize)
 extern "JS_SetGCThreshold" set_gc_threshold(rt: *Runtime, gc_threshold: usize)
 
+// ## The job queue
+//
+// **A promise's continuation is a JOB, and nothing runs a job but this.** quickjs enqueues one every
+// time a promise settles or an `async` function suspends, and `JS_ExecutePendingJob` is the only way
+// they are ever run -- an embedding that never calls it has promises that resolve and continuations
+// that never happen, which looks exactly like a program that hung.
+//
+// **`JS_ExecutePendingJob` answers a COUNT, not a status**: 0 for an empty queue, 1 for a job run,
+// and a negative number where the job threw -- and in that last case `pctx` is filled with the
+// context the exception is on, which is the only way to reach it.
+extern "JS_IsJobPending" is_job_pending(rt: *Runtime) -> bool
+extern "JS_ExecutePendingJob" execute_pending_job(rt: *Runtime, pctx: **Context) -> i32
+
+// ## Promises
+//
+// `JS_PromiseState` answers -1 for a value that is not a promise at all, which is why the module
+// above reads it rather than asking `JS_IsPromise` first and then asking again.
+extern "JS_IsPromise" is_promise(v: Value) -> bool
+extern "JS_PromiseState" promise_state(ctx: *Context, v: Value) -> i32
+extern "JS_PromiseResult" promise_result(ctx: *Context, v: Value) -> Value
+extern "JS_PromiseMarkAsHandled" promise_mark_as_handled(ctx: *Context, v: Value)
+
+c const
+    PROMISE_NOT_A_PROMISE: i32 = "JS_PROMISE_NOT_A_PROMISE"
+    PROMISE_PENDING:       i32 = "JS_PROMISE_PENDING"
+    PROMISE_FULFILLED:     i32 = "JS_PROMISE_FULFILLED"
+    PROMISE_REJECTED:      i32 = "JS_PROMISE_REJECTED"
+
 extern "JS_NewContext" new_context(rt: *Runtime) -> *Context
 extern "JS_FreeContext" free_context(ctx: *Context)
 extern "JS_GetRuntime" get_runtime(ctx: *Context) -> *Runtime

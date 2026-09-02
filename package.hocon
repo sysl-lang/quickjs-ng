@@ -1,10 +1,10 @@
 // JavaScript for sysl — quickjs-ng, embedded.
 //
 //     dependencies {
-//       quickjs { git = "github.com/sysl-lang/quickjs-ng", version = "0.1.0" }
+//       quickjs { git = "github.com/sysl-lang/quickjs-ng", version = "0.2.0" }
 //     }
 //
-// The coordinate is identity rather than a URL, and the version is the tag `v0.1.0` here.
+// The coordinate is identity rather than a URL, and the version is the tag `v0.2.0` here.
 //
 // **quickjs-ng has to be installed, and so do its headers.**
 //
@@ -21,7 +21,7 @@
 
 package {
   name    = "quickjs"
-  version = "0.1.0"
+  version = "0.2.0"
 
   // The compiler this was written against and the only one it is known to build with.
   sysl = "0.0.93"

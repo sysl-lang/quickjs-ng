@@ -312,3 +312,79 @@ a_module()
 
     check(r.eval_module("export const n = 1").is_ok(), "an export is legal in module source")
     check(r.eval("export const n = 1").is_err(), "and illegal in script source")
+
+// -- promises and the job queue -------------------------------------------------------------------
+
+@test("a promise is pending until the queue is drained")
+a_promise_needs_its_jobs()
+    val r = realm().unwrap()
+    val v = r.eval("Promise.resolve(42)").unwrap()
+
+    check(v.is_promise(), "the value is a promise")
+
+    // **This is the whole reason the drain exists.** `eval` answers the moment the SYNCHRONOUS part
+    // of the script is done, so a promise's continuation has not run and `result` is `undefined` --
+    // which is what an embedding with no job queue sees forever.
+    check(v.state() == PromiseState.Fulfilled, "a promise resolved with a value needs no job to settle")
+
+    val chained = r.eval("Promise.resolve(1).then(n => n + 41)").unwrap()
+
+    check(chained.state() == PromiseState.Pending, "a `then` is a job, so it has not run yet")
+    check(r.jobs_pending(), "and the queue says so")
+
+    val ran = r.jobs().unwrap()
+
+    check(ran > 0, "draining ran it")
+    check(chained.state() == PromiseState.Fulfilled, "and the promise settled")
+    check(chained.result().integer().unwrap() == 42, "to what the continuation answered")
+
+@test("an async function's answer is reached by draining")
+an_async_function()
+    val r = realm().unwrap()
+    val v = r.eval("(async () => { const n = await Promise.resolve(6); return n * 7 })()").unwrap()
+
+    check(v.settled().unwrap().integer().unwrap() == 42, "`settled` drains and then reads")
+
+@test("a value that is not a promise settles to itself")
+a_plain_value_settles()
+    val r = realm().unwrap()
+
+    check(r.eval("42").unwrap().settled().unwrap().integer().unwrap() == 42, "there is nothing to wait for")
+    check(r.eval("41").unwrap().state() == PromiseState.NotAPromise, "and it is not a promise")
+
+@test("a rejected promise is an error rather than a value")
+a_rejection()
+    val r = realm().unwrap()
+    val v = r.eval("Promise.reject(new Error('no'))").unwrap()
+
+    check(v.settled().is_err(), "settling a rejection answers an error")
+
+    // **Marked as handled by `settled` having read it**, so the runtime does not report it on the way
+    // out as one nobody looked at.
+    check(v.state() == PromiseState.Rejected, "and the promise says what it is")
+
+@test("a job that throws is reported to whoever asked for the drain")
+a_job_that_throws()
+    val r = realm().unwrap()
+
+    // A `then` whose body throws, with no `catch` after it: the throw happens inside the job, where
+    // there is no script frame to propagate into.
+    val _v = r.eval("Promise.resolve(1).then(() => { throw new Error('inside a job') })").unwrap()
+
+    // **The rejection is the promise's, not the drain's** -- running the job is what settles it, and
+    // a settled rejection is not a failure of the queue. So the drain succeeds and the promise is
+    // rejected, which is JavaScript's own arrangement.
+    check(r.jobs().is_ok(), "the job ran")
+    check(_v.state() == PromiseState.Rejected, "and the promise it belonged to was rejected")
+
+    _v.mark_handled()
+
+@test("a drain that never ends is refused rather than hanging")
+a_runaway_queue()
+    val r = realm().unwrap()
+
+    // A job that enqueues another one, forever. Without a ceiling this is a hang with nothing on
+    // screen, which is the failure a bound exists to turn into a sentence.
+    val _v = r.eval("(function again() { Promise.resolve().then(again) })()").unwrap()
+
+    check(r.jobs(1000).is_err(), "the bound was reached and said so")

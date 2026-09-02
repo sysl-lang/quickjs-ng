@@ -19,9 +19,16 @@
 //
 //     print(r.eval("scale(14)")?.float()?)      // 42
 //
-// **What is not here yet**: promises and the job queue, ES modules with a resolver, classes with
-// sysl-owned instance data, and typed arrays. Each is a coherent piece of work of its own; the
-// surface below is the one an embedding needs before any of them are interesting.
+// **A promise's continuation is a JOB, and nothing runs a job but `realm.jobs()`.** `eval` answers
+// the moment the synchronous part of the script is done, so an embedding that never drains has
+// promises that resolve and continuations that never happen -- `value.settled()` drains and reads,
+// and is what an embedding usually wants.
+//
+//     print(r.eval("(async () => 6 * 7)()")?.settled()?.integer()?)      // 42
+//
+// **What is not here yet**: ES modules with a resolver, classes with sysl-owned instance data, and
+// typed arrays. Each is a coherent piece of work of its own; the surface below is the one an
+// embedding needs before any of them are interesting.
 
 module sh.sysl.quickjs
 
@@ -47,6 +54,16 @@ impl Display for Error
 
 private fault(message: string) -> Error = Error(message, "")
 
+// What a promise is, at a moment.
+//
+// **`NotAPromise` is a state rather than an error**, because `JS_PromiseState` answers it for any
+// value at all -- so a caller may ask this of anything and read the answer.
+enum PromiseState
+    NotAPromise
+    Pending
+    Fulfilled
+    Rejected
+
 // ## The runtime
 //
 // One heap, one atom table, one garbage collector. Several realms may share a runtime and values may
@@ -70,6 +87,15 @@ struct Runtime
     // A ceiling on interpreter stack depth, in bytes. Deep recursion in the script then throws
     // rather than reaching the real stack guard.
     limit_stack(self, bytes: usize) = c.set_max_stack_size(self.rt, bytes)
+
+    // ### The job queue
+    //
+    // **Draining is a REALM's, not a runtime's, because a job that throws leaves its exception on a
+    // CONTEXT** and a runtime has none to read it from. `Realm.jobs` is the one to call.
+    jobs_pending(self) -> bool = c.is_job_pending(self.rt)
+
+    private[quickjs] raw(self) -> *c.Runtime = self.rt
+
 end Runtime
 
 impl Drop for Runtime
@@ -208,6 +234,60 @@ struct Realm
 
     // Reads the pending exception out and turns it into an `Error`. **Both strings are copied**, so
     // the exception value itself is released here and the `Error` refers to nothing.
+    // ### The job queue
+    //
+    // **A promise's continuation is a JOB, and nothing runs a job but this.** quickjs enqueues one
+    // every time a promise settles or an `async` function suspends, and `eval` answers the moment the
+    // *synchronous* part of the script is done -- so an embedding that never drains has promises that
+    // resolve and continuations that never happen, which reads as a program that hung rather than as
+    // a missing call.
+    //
+    //     val v = r.eval("(async () => 6 * 7)()")?
+    //
+    //     print(v.settled()?.integer()?)       // 42
+    jobs_pending(self) -> bool = self.rt.jobs_pending()
+
+    // Runs one job, and answers whether there was one.
+    //
+    // **A job that THROWS is an error here rather than an exception left where nobody looks.** There
+    // is no script frame to propagate into -- the job is a continuation the engine chose to run --
+    // so the failure belongs to whoever asked for the drain.
+    job(*self) -> Result[bool, Error]
+        var where: *c.Context = ptr_cast(0usize)
+        val n = c.execute_pending_job(self.rt.raw(), &where)
+
+        if n == 0 then return Ok(false)
+        if n > 0 then return Ok(true)
+
+        // **The context comes back through `pctx`, and it may not be this realm's.** One runtime may
+        // hold several, and an exception is read from the context it is on -- so rather than read
+        // this realm's and report whatever happened to be there, a job from elsewhere is named as
+        // what it is.
+        if usize(where) != usize(self.ctx)
+            return Err(fault("a job belonging to another realm of this runtime failed"))
+
+        Err(self.take_exception())
+    end job
+
+    // Runs jobs until the queue is empty, and answers how many ran.
+    //
+    // **Bounded, because a job may enqueue another one.** A promise chain that resolves in a loop is
+    // an ordinary way to do that by accident, and a drain with no ceiling is then a hang with nothing
+    // on screen. The limit is generous enough that no honest program reaches it.
+    jobs(*self, limit: usize = 100_000) -> Result[usize, Error]
+        var ran: usize = 0
+
+        loop
+            if ran >= limit
+                return Err(fault(s"the job queue was still not empty after ${limit} jobs, which means a job is enqueueing another one"))
+
+            if !self.job()? then break
+
+            ran += 1
+
+        Ok(ran)
+    end jobs
+
     private[quickjs] take_exception(self) -> Error
         val exc = c.get_exception(self.ctx)
         val message = self.render(exc)
@@ -307,6 +387,55 @@ struct Value
     is_error(self) -> bool = c.is_error(self.raw)
     is_date(self) -> bool = c.is_date(self.raw)
     is_function(self) -> bool = c.is_function(self.realm.ctx, self.raw)
+    is_promise(self) -> bool = c.is_promise(self.raw)
+
+    // ### A promise
+    //
+    // **`state` answers what the promise IS, and it is read rather than tested for** -- quickjs says
+    // `NotAPromise` for a value that is not one, so asking twice would be asking the same question
+    // twice.
+    state(self) -> PromiseState
+        val n = c.promise_state(self.realm.ctx, self.raw)
+
+        if n == c.PROMISE_PENDING then return PromiseState.Pending
+        if n == c.PROMISE_FULFILLED then return PromiseState.Fulfilled
+        if n == c.PROMISE_REJECTED then return PromiseState.Rejected
+
+        PromiseState.NotAPromise
+    end state
+
+    // What a settled promise settled to -- its value, or the reason it was rejected.
+    //
+    // **A PENDING promise answers `undefined` rather than an error**, which is what quickjs does and
+    // is the honest answer: nothing has happened yet.
+    result(self) -> &Value = self.realm.value(c.promise_result(self.realm.ctx, self.raw))
+
+    // **Marks a rejection as somebody's business**, so the runtime does not report it as unhandled on
+    // the way out. A caller reading `result` off a rejected promise has handled it by doing so.
+    mark_handled(self) = c.promise_mark_as_handled(self.realm.ctx, self.raw)
+
+    // The value this settled to, having drained the jobs it was waiting on.
+    //
+    // **This is the whole of what an embedding wants from a promise**, and it is here rather than in
+    // the caller because getting it wrong is silent: reading `result` without draining answers
+    // `undefined` from a promise that was one job away from its answer.
+    settled(self) -> Result[&Value, Error]
+        if !self.is_promise() then return Ok(self)
+
+        val _ran = self.realm.jobs()?
+
+        self.state() match
+            PromiseState.Fulfilled -> Ok(self.result())
+            PromiseState.Rejected ->
+                self.mark_handled()
+
+                val why = self.result().text() match
+                    Ok(said) -> said
+                    Err(e) -> e.message
+
+                Err(fault(s"the promise was rejected: ${why}"))
+            _ -> Err(fault("the promise is still pending after every job it was waiting on has run"))
+    end settled
 
     // ### Reading it out
     //

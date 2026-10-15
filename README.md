@@ -2,6 +2,8 @@
 
 **JavaScript for sysl — a quickjs-ng embedding, with no C shim.**
 
+*An independent sysl package for quickjs-ng. It is not affiliated with or endorsed by quickjs-ng's authors or trademark holders.*
+
 ```
 dependencies {
   quickjs { git = "github.com/sysl-lang/quickjs-ng", version = "0.2.0" }

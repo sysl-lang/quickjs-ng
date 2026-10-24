@@ -6,7 +6,7 @@
 
 ```
 dependencies {
-  quickjs { git = "github.com/sysl-lang/quickjs-ng", version = "0.2.0" }
+  quickjs { git = "github.com/sysl-lang/quickjs-ng", version = "0.2.1" }
 }
 ```
 

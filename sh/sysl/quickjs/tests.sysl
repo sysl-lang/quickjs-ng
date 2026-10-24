@@ -352,6 +352,20 @@ a_plain_value_settles()
     check(r.eval("42").unwrap().settled().unwrap().integer().unwrap() == 42, "there is nothing to wait for")
     check(r.eval("41").unwrap().state() == PromiseState.NotAPromise, "and it is not a promise")
 
+@test("a heap value that is not a promise settles to itself without being freed twice")
+a_plain_heap_value_settles()
+    val r = realm().unwrap()
+
+    // An object and a string live on the engine's heap and are reference counted, so a second owner of
+    // one handle frees it twice: the runtime's teardown then aborts or reads freed memory.
+    val o = r.eval("({ n: 7 })").unwrap()
+    check(o.settled().unwrap().get("n").unwrap().integer().unwrap() == 7, "an object settles to itself")
+    check(o.get("n").unwrap().integer().unwrap() == 7, "and is still alive afterwards")
+
+    val s = r.eval("'a string long enough to be on the heap'").unwrap()
+    check(s.settled().unwrap().text().unwrap() == "a string long enough to be on the heap", "a string settles to itself")
+    check(s.text().unwrap() == "a string long enough to be on the heap", "and is still alive afterwards")
+
 @test("a rejected promise is an error rather than a value")
 a_rejection()
     val r = realm().unwrap()

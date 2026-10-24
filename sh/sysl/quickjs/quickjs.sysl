@@ -419,7 +419,7 @@ struct Value
     // **This is the whole of what an embedding wants from a promise**, and it is here rather than in
     // the caller because getting it wrong is silent: reading `result` without draining answers
     // `undefined` from a promise that was one job away from its answer.
-    settled(self) -> Result[&Value, Error]
+    settled(&self) -> Result[&Value, Error]
         if !self.is_promise() then return Ok(self)
 
         val _ran = self.realm.jobs()?

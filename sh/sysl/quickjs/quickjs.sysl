@@ -36,6 +36,7 @@ import sh.sysl.quickjs.c
 import sysl.buf.{Buf, buf}
 import sysl.text.{cstring, from_cstring}
 import sysl.slices.{as_ptr, as_mut_ptr}
+import sysl.raw.ptr_cast
 
 // ## What goes wrong
 //

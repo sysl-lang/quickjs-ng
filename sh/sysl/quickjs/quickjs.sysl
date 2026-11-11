@@ -544,7 +544,7 @@ struct Value
         for a in args
             raws.push(a.raw)
 
-        val raw = c.call(self.realm.ctx, self.raw, this_value.raw, i32(args.len), as_mut_ptr(raws.view()))
+        val raw = c.call(self.realm.ctx, self.raw, this_value.raw, i32(args.len), as_mut_ptr(raws.view_mut()))
 
         if raw.tag == c.TAG_EXCEPTION then return Err(self.realm.take_exception())
 
